@@ -1,10 +1,9 @@
 import time
 import board
 import busio
-#Add Temperature/Humidity sensor driver
 import adafruit_sht31d
+from adafruit_seesaw.seesaw import Seesaw
 from decimal import *
-#Add ability to run external commands and retrieve output
 from subprocess import check_output
 import datetime as dt
 import urllib.request
@@ -25,23 +24,32 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.setLevel(logging.DEBUG)
 logger.debug("Script started.")
-# Create library object using our Bus I2C port
+ss = []
+# set up i2c connections
 try:
+#connect i2c bus 1
     i2c = busio.I2C(board.SCL, board.SDA)
+#connect i2c bus 3
+    i2c3 = busio.I2C(board.D17, board.D4)
 except Exception as e:
     logger.debug("Could not get i2c bus: "+str(e))
-#Connect to sensor
+#Connect to sensors
 try:
     sensor = adafruit_sht31d.SHT31D(i2c)
+    ss.insert(0, Seesaw(i2c, addr=0x36))
+    ss.insert(1, Seesaw(i2c, addr=0x37))
+    ss.insert(2, Seesaw(i2c3, addr=0x36))
+    ss.insert(3, Seesaw(i2c3, addr=0x37))
+
 except Exception as e:
-    logger.debug("Could not get SHT31-D Temp/Humidity sensor: "+str(e))
+    logger.debug("Could not get SHT31-D Temp/Humidity or soil sensors: "+str(e))
 
 # Configure InfluxDB connection variables
-host = "10.0.0.13" # My Ubuntu NUC
+host = "localhost" # My Ubuntu NUC
 port = 8086 # default port
-user = "rpi-3" # the user/password created for the pi, with write access
-password = "data@LOG" 
-dbname = "sensor_data" # the database we created earlier
+user = "" # the user/password created for the pi, with write access
+password = "" 
+dbname = "_internal" # the database we created earlier
 # Create the InfluxDB client object
 client = InfluxDBClient(host, port, user, password, dbname)
 loopcount = 0
@@ -55,17 +63,33 @@ humidifierstatus = "not set"
 fanstatus = "not set"
 heaterstatus = "not set" 
 coldprotecttriggered = 0    
-starthr = 8 # before midnight
+starthr = 8 # must be before stop hr, same day
 startmin = 1
-stophr = 16 # after midnight
+stophr = 16 # must be after start hr, same day
 stopmin = 1
 piccount = 0
-#Initialize last picture time to one hour before the script started, so it always takes a picture off the start
-#lastpictime = dt.datetime.now() - dt.timedelta(hours=1)
 lastpictime = dt.datetime.now()
 picfoldername = dt.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 vpdset = 9.0 #set default value
 nightvpdset = 7.5 #set default value
+
+def getsoilmoisture(i):
+    global ss
+    try:
+        #get moisture
+        sens = ss[i].moisture_read()
+        return sens
+    except Exception as e:
+        logging.debug("Could not get temperature from Sensor "+str(i)+": "+str(e))
+
+def getsoiltemp(i):
+    global ss
+    try:
+        #read temperature from the temperature sensor
+        temp = ss[i].get_temp()
+        return temp
+    except Exception as e:
+        logging.debug("Could not get moisture reading from Sensor "+str(i)+": "+str(e))
 
 def makepicdir(folder):
     try:
@@ -73,7 +97,7 @@ def makepicdir(folder):
     except Exception as e:
         logger.debug("Could not create picture folder: "+str(e))
 
-def shipEnviroData(grafTemp, grafHum, grafvpd):
+def shipEnviroData(grafTemp, grafHum, grafvpd, soil0, soil1, soil2, soil3):
     global sensortype
     iso = time.ctime()
     # Create the JSON data structure
@@ -85,9 +109,13 @@ def shipEnviroData(grafTemp, grafHum, grafvpd):
             },
             "time": iso,
             "fields": {
-                "temperature" : grafTemp,
-                "humidity": grafHum,
-                "vpd": grafvpd
+                "1.01" : grafTemp,
+                "2.01": grafHum,
+                "3.01": grafvpd,
+                "4.01": soil0,
+                "5.01": soil1,
+                "6.01": soil2,
+                "7.01": soil3
             }
         }
     ]
@@ -98,7 +126,7 @@ def shipEnviroData(grafTemp, grafHum, grafvpd):
 
 #Read config
 def readconfig():
-    global lastpictime, nighttemphigh, nighttemplow, nighthumhigh, nighthumlow, temphigh, templow, humhigh, humlow, coldprotecttemp, sleeptime, vpdset, nightvpdset
+    global lastpictime, nighttemphigh, nighttemplow, nighthumhigh, nighthumlow, temphigh, templow, humhigh, humlow, coldprotecttemp, sleeptime, vpdset, nightvpdset,units
     try:
         config = configparser.ConfigParser()
         config.read('config.ini')
@@ -120,6 +148,8 @@ def readconfig():
         fanoffcount = Decimal(config['DEFAULT']['FANOFFCOUNT'])
         vpdset = Decimal(config['DEFAULT']['VPD'])
         nightvpdset = Decimal(config['DEFAULT']['NIGHTVPD'])
+        units = config['DEFAULT']['UNITS']
+        
     except Exception as e:
         logger.debug("Could not read configuration: "+str(e))
         exit()
@@ -190,7 +220,7 @@ def humidifieroff():
 def heateron():
     global heateroncycles
     try:
-        check_output("python /usr/local/bin/wemo switch 'heater bud 1' on",shell=True)
+        check_output("python /usr/local/bin/wemo switch 'heater' on",shell=True)
         heateroncycles += 1
         logger.debug("Heater turned on. Count: "+str(heateroncycles))
     except Exception as e:
@@ -199,7 +229,7 @@ def heateron():
 def heateroff():
     global heateroffcycles
     try:
-        check_output("python /usr/local/bin/wemo switch 'heater bud 1' off",shell=True)
+        check_output("python /usr/local/bin/wemo switch 'heater' off",shell=True)
         heateroffcycles += 1
         logger.debug("Heater turned off. Count: "+str(heateroffcycles))
     except Exception as e:
@@ -212,6 +242,29 @@ def gettemp():
         return round(Decimal(temp),2)
     except Exception as e:
         logger.debug("Could not get temperature: "+str(e))
+
+def gettempf():
+   #Get temp in freedom units
+   try:
+        temp = round(sensor.temperature*1.8+32,1)
+        return round(Decimal(temp),2)
+   except Exception as e:
+        logger.debug("Could not calculate freedom units: " +str(e))
+
+def tempunit():
+    global units
+
+  #Determine what unit to use
+    if units == 'F':
+      try:
+        temp = round(sensor.temperature*1.8+32,1)
+        return round(Decimal(temp),2)
+      except Exception as e:
+        logger.debug("Could not calculate freedom units: " +str(e))
+    elif units == 'C':
+        temp = round(sensor.temperature,1)
+        return round(Decimal(temp),2)
+
 
 def gethum():
     #Get current humidity
@@ -237,7 +290,7 @@ def checkhumidifier():
 
 def checkheater():
     try:
-        check = check_output("python /usr/local/bin/wemo -v switch 'heater bud 1' status",shell=True)
+        check = check_output("python /usr/local/bin/wemo -v switch 'heater' status",shell=True)
         return str(check)
     except Exception as e:
         logger.debug("Could not get heater status: "+str(e))
@@ -396,31 +449,15 @@ def fixhum():
                 humidifieron()
             elif "on" in humidifierstatus:
                 logger.debug("Humidifier is on already.")
-
+                
+#only works if start and stop are same day
 def checktime(starthour, startmin, stophour, stopmin):
-    # Set the now time to an integer that is hours * 60 + minutes
     n = dt.datetime.now()
-    now = n.hour * 60 + n.minute 
-     
-    # Set the start time to an integer that is hours * 60 + minutes
     str = dt.time(starthour, startmin)
-    start = str.hour * 60 + str.minute 
-     
-    # Set the stop time to an integer that is hours * 60 + minutes
     stp = dt.time(stophour, stopmin)
-    stop = stp.hour * 60 + stp.minute
-    if n.hour >= str.hour:
-        if n.hour < stp.hour:
-            return False #night
-    return True
-    # handle midnight by adding 24 hours to stop time and now time
-    #if stop < start:
-       # stop += 1440
-      #  now += 1440 
-    #see if we are in the range
-  #  if start <= now > stop:
-      #  return True
-  #  return False
+    if n.hour >= str.hour and n.hour < stp.hour:
+            return True #Lights On
+    return False #Lights Off
 
 def pilightsoff():
     try:
@@ -429,6 +466,13 @@ def pilightsoff():
     except Exception as e:
         logger.debug("Cannot disable Pi LEDs: "+str(e))
 
+def getsoilinfo(i):
+    try:
+        ssm = getsoilmoisture(i)
+        sst = getsoiltemp(i) 
+        logger.debug("Soil "+str(i)+" Moisture: "+str(ssm)+" Temp: "+str(round(Decimal(sst),2)))
+    except Exception as e:
+        logger.debug("Could not read soil moisture/temp sensor "+str(i)+": "+str(e))
 
 makepicdir(picfoldername)
 pilightsoff()
@@ -438,11 +482,29 @@ while True:
         logger.debug("\r")
         when = checktime(starthr,startmin,stophr,stopmin)
         if when == False:
-            logger.debug("Night time detected.")
+            logger.debug("Lights Off Detected.")
         elif when == True:
-            logger.debug("Day time detected.")
+            logger.debug("Lights On Detected.")
+        getsoilinfo(0)
+        getsoilinfo(1)
+        getsoilinfo(2)
+        getsoilinfo(3)
+        ssm0 = getsoilmoisture(0)
+        ssm1 = getsoilmoisture(1)
+        ssm2 = getsoilmoisture(2)
+        ssm3 = getsoilmoisture(3)
+        if ssm0 > 2000:
+            ssm0=0
+        if ssm1 > 2000:
+            ssm1=0
+        if ssm2 > 2000:
+            ssm2=0
+        if ssm3 > 2000:
+            ssm3=0
         readconfig()
         temp = gettemp()
+        tempf = gettempf()
+        tempu = tempunit()
         humidity = gethum()
         fanstatus = checkfan()
         humidifierstatus = checkhumidifier()
@@ -450,11 +512,11 @@ while True:
         logger.debug("Temperature: "+str(temp))
         logger.debug("Humidity: "+str(humidity))
         calcVPD()
-        shipEnviroData(str(temp),str(humidity),str(vpd))
+        shipEnviroData(float(temp),float(humidity),float(vpd),float(ssm0),float(ssm1), float(ssm2), float(ssm3))
         fixtemp()
         fixvpd()
-        #fixhum()
-        takepic()
+        fixhum()
+       #takepic()
         loopcount += 1
         time.sleep(int(sleeptime))
     except Exception as e:
