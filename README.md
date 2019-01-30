@@ -1,6 +1,8 @@
 JustinCredible:
 # PotPi
-Software to control a grow cabinet
+Software to control a grow cabinet!
+
+
 you will need:
 
 Soldering pen & electronics solder
